@@ -2,7 +2,7 @@
 import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data
-from torch_geometric.nn import SAGEConv
+from torch_geometric.nn import GCNConv
 import numpy as np
 import scipy.spatial
 import matplotlib.pyplot as plt
@@ -10,23 +10,25 @@ import matplotlib.pyplot as plt
 # Step 1: Data Generation (Simulating the RAN)
 def generate_data(num_nodes=100, grid_size=10):
     """
-    Generates a simulated Radio Access Network (RAN) using Delaunay triangulation.
+    Generates a simulated Radio Access Network (RAN) using Delaunay triangulation
+    and a gravity model for edge weights.
     """
     # 1. Nodes (gNBs): Generate random (x, y) coordinates
     node_coords = np.random.rand(num_nodes, 2) * grid_size
+    x = torch.tensor(node_coords, dtype=torch.float)
 
     # 2. Edges (Connections): Use Delaunay Triangulation
     tri = scipy.spatial.Delaunay(node_coords)
     edges = np.vstack([tri.simplices[:, [0, 1]], tri.simplices[:, [1, 2]], tri.simplices[:, [0, 2]]])
-    
-    # Create a symmetric adjacency list
     edge_index = torch.tensor(np.sort(edges), dtype=torch.long).t().contiguous()
 
-    # 3. Weights (Handover Traffic): Generate random weights for edges
-    edge_attr = torch.rand(edge_index.size(1), 1)
+    # 3. Weights (Handover Traffic): Use an inverse distance gravity model
+    row, col = edge_index
+    dist = torch.norm(x[row] - x[col], p=2, dim=1)
+    edge_attr = 1.0 / (dist + 1e-5) # Add epsilon to avoid division by zero
+    edge_attr = edge_attr.view(-1, 1)
 
     # 4. Packaging: Convert to PyG Data object
-    x = torch.tensor(node_coords, dtype=torch.float)
     data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
     
     return data
@@ -34,23 +36,30 @@ def generate_data(num_nodes=100, grid_size=10):
 # Step 2: Model Architecture (Designing I-GAP)
 class IGAP(torch.nn.Module):
     """
-    The I-GAP model, consisting of a GraphSAGE encoder and a simple MLP decoder.
+    The I-GAP model, consisting of a GCN encoder and a simple MLP decoder.
+    This version incorporates edge weights and a feature projection layer.
     """
     def __init__(self, in_channels, hidden_channels, out_channels):
         super(IGAP, self).__init__()
-        # Part A: The Graph Embedder (Encoder)
-        self.conv1 = SAGEConv(in_channels, hidden_channels)
-        self.conv2 = SAGEConv(hidden_channels, hidden_channels)
+        # Project 2D coords to a higher dimensional feature space
+        self.feature_proj = torch.nn.Linear(in_channels, 128)
         
-        # Part B: The Partitioner (Decoder)
+        # GCN layers that support edge weights
+        self.conv1 = GCNConv(128, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, hidden_channels)
+        
+        # Partitioner (Decoder)
         self.lin1 = torch.nn.Linear(hidden_channels, hidden_channels)
         self.lin2 = torch.nn.Linear(hidden_channels, out_channels)
 
-    def forward(self, x, edge_index):
-        # Encoder
-        x = self.conv1(x, edge_index)
+    def forward(self, x, edge_index, edge_weight):
+        # Project features
+        x = F.relu(self.feature_proj(x))
+        
+        # Encoder with edge weights
+        x = self.conv1(x, edge_index, edge_weight.squeeze())
         x = F.relu(x)
-        x = self.conv2(x, edge_index)
+        x = self.conv2(x, edge_index, edge_weight.squeeze())
         x = F.relu(x)
 
         # Decoder
@@ -63,25 +72,39 @@ class IGAP(torch.nn.Module):
 # Step 3: The Custom Loss Function
 def custom_loss(output, data, alpha=1.0, beta=1.0):
     """
-    Implements the custom loss function from the paper (Equation 9).
+    Implements the custom loss function from the paper (Equation 9) using vectorized operations.
     Loss = alpha * EdgeCut_Loss + beta * LoadBalance_Loss
     """
-    # 1. Calculate Edge Cut Loss
-    edge_cut_loss = 0
-    for i in range(data.edge_index.size(1)):
-        u, v = data.edge_index[0, i], data.edge_index[1, i]
-        # Penalize if connected nodes are in different partitions
-        edge_cut_loss += torch.sum(1 - torch.sum(output[u] * output[v])) * data.edge_attr[i]
-        
-    # 2. Calculate Load Balancing Loss
-    partition_sizes = torch.sum(output, dim=0)
-    mean_size = torch.mean(partition_sizes)
-    load_balance_loss = torch.sum((partition_sizes - mean_size)**2)
+    # 1. Load Balancing Loss (Vectorized)
+    # Eq 8: sum((sum(x_ik) - N/P)^2)
+    partition_sizes = torch.sum(output, dim=0) # (P)
+    target_size = data.num_nodes / output.size(1)
+    load_balance_loss = torch.sum((partition_sizes - target_size) ** 2)
 
-    # 3. Combine
-    total_loss = (alpha * edge_cut_loss) + (beta * load_balance_loss)
-    
-    return total_loss
+    # 2. Edge Cut Loss (Vectorized)
+    # Eq 7: sum( X * (1-X)^T . W )
+    # We want to penalize edges (u,v) where output[u] and output[v] are DIFFERENT.
+    # Similarity = output[u] dot output[v].
+    # Loss contribution = weight * (1 - Similarity)
+
+    # Get source and target nodes from edge_index
+    u, v = data.edge_index
+
+    # Calculate dot product for every edge pair efficiently
+    # (Edges, P) * (Edges, P) -> sum over P -> (Edges)
+    # Gather the probability vectors for all source nodes u and target nodes v
+    prob_u = output[u]
+    prob_v = output[v]
+
+    # Dot product: sum(u_k * v_k)
+    similarity = torch.sum(prob_u * prob_v, dim=1)
+
+    # Total Edge Cut Loss = Sum( weight_uv * (1 - similarity_uv) )
+    # Ensure edge_attr is squeezed to shape (Edges,)
+    weights = data.edge_attr.squeeze()
+    edge_cut_loss = torch.sum(weights * (1 - similarity))
+
+    return alpha * edge_cut_loss + beta * load_balance_loss
 
 # Step 4: The Training Loop
 def train(model, data, optimizer, epochs=200):
@@ -93,7 +116,7 @@ def train(model, data, optimizer, epochs=200):
         optimizer.zero_grad()
         
         # 1. Forward Pass
-        output = model(data.x, data.edge_index)
+        output = model(data.x, data.edge_index, data.edge_attr)
         
         # 2. Loss Calculation
         loss = custom_loss(output, data)
@@ -112,7 +135,7 @@ def visualize(model, data):
     """
     model.eval()
     with torch.no_grad():
-        output = model(data.x, data.edge_index)
+        output = model(data.x, data.edge_index, data.edge_attr)
         pred = output.argmax(dim=1)
 
     plt.figure(figsize=(10, 10))
