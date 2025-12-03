@@ -5,6 +5,8 @@ def custom_loss(output, data, alpha=1.0, beta=1.0):
     """
     Implements the custom loss function from the paper (Equation 9) using vectorized operations.
     Loss = alpha * EdgeCut_Loss + beta * LoadBalance_Loss
+    
+    Returns the total loss, and the unweighted individual loss components.
     """
     # 1. Load Balancing Loss (Vectorized)
     # Eq 8: sum((sum(x_ik) - N/P)^2)
@@ -35,4 +37,6 @@ def custom_loss(output, data, alpha=1.0, beta=1.0):
     weights = data.edge_attr.squeeze()
     edge_cut_loss = torch.sum(weights * (1 - similarity))
 
-    return alpha * edge_cut_loss + beta * load_balance_loss
+    total_loss = alpha * edge_cut_loss + beta * load_balance_loss
+    
+    return total_loss, edge_cut_loss, load_balance_loss
