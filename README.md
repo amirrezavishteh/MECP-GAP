@@ -60,14 +60,14 @@ The script will print the training loss for every 20 epochs. After training, a M
 
 ## Code Structure
 
-The entire implementation is contained within `main.py`:
+The project is organized into a modular structure to improve readability and maintainability:
 
-*   `generate_data()`: Creates node coordinates, edges (via Delaunay), and edge weights, returning a `torch_geometric.data.Data` object.
-*   `IGAP(torch.nn.Module)`: Defines the GraphSAGE-based encoder and MLP-based decoder.
-*   `custom_loss()`: Implements the combined Edge Cut and Load Balancing loss function.
-*   `train()`: Manages the model training loop.
-*   `visualize()`: Renders the final partitioning using Matplotlib.
-*   `if __name__ == '__main__':`: The main execution block, setting parameters, calling data generation, model initialization, training, and visualization.
+*   **`main.py`**: The main entry point of the application. It orchestrates the entire pipeline by importing modules, setting parameters, and calling the necessary functions in order.
+*   **`data_generation.py`**: Contains the `generate_data` function, which is responsible for creating the simulated Radio Access Network (RAN) graph data, including node coordinates, edges, and traffic-based edge weights.
+*   **`model.py`**: Defines the `IGAP` GNN model class. This includes the feature projection layer, the GCN-based encoder, and the MLP-based decoder.
+*   **`loss.py`**: Contains the `custom_loss` function, which implements the vectorized, mobility-aware loss function combining Edge Cut and Load Balancing penalties.
+*   **`training.py`**: Contains the `train` function, which handles the model training loop, including the forward pass, loss calculation, and backpropagation.
+*   **`visualization.py`**: Contains the `visualize` function, responsible for running the model in evaluation mode and generating the final plot of the partitioned graph using Matplotlib.
 
 ## Results
 
